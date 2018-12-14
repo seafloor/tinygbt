@@ -11,6 +11,9 @@
 
 import sys
 import time
+import numpy as np
+import pprint as pp
+
 try:
     # For python2
     from itertools import izip as zip
@@ -36,6 +39,10 @@ class TreeNode(object):
         self.split_feature_id = None
         self.split_val = None
         self.weight = None
+        self.subsample = None
+        self.prs_from_subsample = None
+        self.prs_betas = None
+        self.ran_seed = None
 
     def _calc_split_gain(self, G, H, G_l, H_l, G_r, H_r, lambd):
         """
@@ -53,7 +60,24 @@ class TreeNode(object):
         """
         return np.sum(grad) / (np.sum(hessian) + lambd)
 
-    def build(self, instances, grad, hessian, shrinkage_rate, depth, param):
+    def _generate_prs(self, instances, prs_indices, prs_weights, matrix=True):
+        """Create sample-wise polygenic risk score from SNPs in prs_indices using prs_weights"""
+
+        prs = np.zeros(instances.shape[0])
+
+        if matrix:
+            for i in range(instances.shape[0]):
+                mult = prs_weights[prs_indices] * instances[i, prs_indices]
+                prs[i] = sum(mult) / prs_indices.shape[0]
+            instances = np.c_[instances, prs]
+        else:
+            mult = prs_weights[prs_indices] * instances[prs_indices]
+            prs = sum(mult) / prs_indices.shape[0]
+            instances = np.r_[instances, prs]
+
+        return instances
+
+    def build(self, instances, grad, hessian, shrinkage_rate, depth, random_seed, param):
         """
         Exact Greedy Alogirithm for Split Finidng
         (Refer to Algorithm1 of Reference[1])
@@ -63,6 +87,30 @@ class TreeNode(object):
             self.is_leaf = True
             self.weight = self._calc_leaf_weight(grad, hessian, param['lambda']) * shrinkage_rate
             return
+        if depth == 0:
+            self.subsample = param['subsample']
+            if param['subsample'] > 0:
+                # add prs and reset indices to remove SNPs in the PRS
+                if param['prs_betas'] is None:
+                    prs_weights = np.ones(instances.shape[1], int)
+                else:
+                    prs_weights = param['prs_betas']
+                self.prs_betas = prs_weights
+                self.ran_seed = random_seed
+                np.random.seed(random_seed)
+                prs_indices = np.random.choice(np.arange(instances.shape[1]),
+                                               int(param['subsample'] * instances.shape[1]),
+                                               replace=False)
+                self.prs_from_subsample = param['prs_from_subsample']
+                if param['prs_from_subsample']:
+                    instances = self._generate_prs(instances, prs_indices, prs_weights)
+                feature_ix = np.delete(np.arange(instances.shape[1]), prs_indices)
+            else:
+                feature_ix = range(instances.shape[1])
+        else:
+            feature_ix = range(instances.shape[1])
+
+
         G = np.sum(grad)
         H = np.sum(hessian)
         best_gain = 0.
@@ -70,7 +118,7 @@ class TreeNode(object):
         best_val = 0.
         best_left_instance_ids = None
         best_right_instance_ids = None
-        for feature_id in range(instances.shape[1]):
+        for feature_id in feature_ix:
             G_l, H_l = 0., 0.
             sorted_instance_ids = instances[:,feature_id].argsort()
             for j in range(sorted_instance_ids.shape[0]):
@@ -97,16 +145,25 @@ class TreeNode(object):
                                   grad[best_left_instance_ids],
                                   hessian[best_left_instance_ids],
                                   shrinkage_rate,
-                                  depth+1, param)
+                                  depth+1, random_seed, param)
 
             self.right_child = TreeNode()
             self.right_child.build(instances[best_right_instance_ids],
                                    grad[best_right_instance_ids],
                                    hessian[best_right_instance_ids],
                                    shrinkage_rate,
-                                   depth+1, param)
+                                   depth+1, random_seed, param)
 
     def predict(self, x):
+        if self.subsample is not None:
+            if self.subsample > 0:
+                # add prs and reset indices to remove SNPs in the PRS
+                if self.prs_from_subsample:
+                    np.random.seed(self.ran_seed)
+                    prs_indices = np.random.choice(np.arange(x.shape[0]),
+                                                   int(self.subsample * x.shape[0]),
+                                                   replace=False)
+                    x = self._generate_prs(x, prs_indices, self.prs_betas, matrix=False)
         if self.is_leaf:
             return self.weight
         else:
@@ -121,11 +178,11 @@ class Tree(object):
     def __init__(self):
         self.root = None
 
-    def build(self, instances, grad, hessian, shrinkage_rate, param):
+    def build(self, instances, grad, hessian, shrinkage_rate, random_seed, param):
         assert len(instances) == len(grad) == len(hessian)
         self.root = TreeNode()
         current_depth = 0
-        self.root.build(instances, grad, hessian, shrinkage_rate, current_depth, param)
+        self.root.build(instances, grad, hessian, shrinkage_rate, current_depth, random_seed, param)
 
     def predict(self, x):
         return self.root.predict(x)
@@ -138,6 +195,9 @@ class GBT(object):
                        'min_split_gain': 0.1,
                        'max_depth': 5,
                        'learning_rate': 0.3,
+                       'subsample': 0.7,
+                       'prs_from_subsample': True,
+                       'prs_betas': None
                        }
         self.best_iteration = None
 
@@ -173,9 +233,9 @@ class GBT(object):
         """For now, only L2 loss is supported"""
         return self._calc_l2_loss(models, data_set)
 
-    def _build_learner(self, train_set, grad, hessian, shrinkage_rate):
+    def _build_learner(self, train_set, grad, hessian, shrinkage_rate, random_seed):
         learner = Tree()
-        learner.build(train_set.X, grad, hessian, shrinkage_rate, self.params)
+        learner.build(train_set.X, grad, hessian, shrinkage_rate, random_seed, self.params)
         return learner
 
     def train(self, params, train_set, num_boost_round=20, valid_set=None, early_stopping_rounds=5):
@@ -188,11 +248,14 @@ class GBT(object):
 
         print("Training until validation scores don't improve for {} rounds."
               .format(early_stopping_rounds))
+        print("Using params:")
+        pp.pprint(self.params)
         for iter_cnt in range(num_boost_round):
             iter_start_time = time.time()
             scores = self._calc_training_data_scores(train_set, models)
             grad, hessian = self._calc_gradient(train_set, scores)
-            learner = self._build_learner(train_set, grad, hessian, shrinkage_rate)
+            learner = self._build_learner(train_set, grad, hessian, shrinkage_rate, iter_cnt)
+
             if iter_cnt > 0:
                 shrinkage_rate *= self.params['learning_rate']
             models.append(learner)
